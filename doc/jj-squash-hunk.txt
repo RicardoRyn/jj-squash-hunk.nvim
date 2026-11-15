@@ -1,0 +1,68 @@
+*jj-squash-hunk.txt*  Squash reviewed hunks into the parent jj change
+
+==============================================================================
+Introduction                                                  *jj-squash-hunk*
+
+jj-squash-hunk.nvim moves the hunk under the cursor, or every hunk overlapping a
+visual selection, from the jj working change into its parent change.
+
+jj has no staging area, so "I have reviewed this hunk" has nowhere to go. The
+manual answer is `jj squash -i` with the hunk picked in a diff editor; this plugin
+automates that single hunk. The reviewed lines land in `@-`, everything else stays
+in `@`.
+
+Requires Neovim 0.12 or newer and `jj` on $PATH.
+
+==============================================================================
+Usage                                                   *jj-squash-hunk-usage*
+
+:JJSquashHunk       squash the hunk under the cursor
+:'<,'>JJSquashHunk  squash the hunks in the visual selection
+:5,12JJSquashHunk   squash the hunks overlapping lines 5 through 12
+
+Lua API, see |jj-squash-hunk-lua|:
+    require('jj_squash_hunk').squash_lines(first, last)
+
+The plugin registers no keymaps; these are suggestions: >
+    vim.keymap.set("n", "<leader>gs", "<cmd>JJSquashHunk<cr>")
+    vim.keymap.set("x", "<leader>gs", ":JJSquashHunk<cr>")
+<
+
+==============================================================================
+Configuration           *jj-squash-hunk-config* *jj-squash-hunk-configuration*
+
+opts = { diff_context = 0 }
+
+diff_context    Number, default 0. The ctxlen passed to |vim.text.diff()|.
+                0 makes each hunk a maximal block of contiguous changed lines,
+                matching gitsigns-style signs. Larger values merge changes
+                separated by at most 2 * diff_context unchanged lines.
+
+==============================================================================
+Setup API                                                 *jj-squash-hunk-lua*
+
+M.setup({opts})                                       *jj_squash_hunk.setup()*
+    Merge {opts} into the defaults. No keymaps are registered; see
+    |jj-squash-hunk-usage|.
+
+M.squash_lines({first}, {last})                *jj_squash_hunk.squash_lines()*
+    Squash every hunk overlapping the 1-based inclusive line range. {first} is
+    the first line, {last} the last line.
+
+==============================================================================
+How it works                                        *jj-squash-hunk-mechanism*
+
+1.  The buffer is written, because jj snapshots files from disk.
+2.  The parent version is read with `jj file show -r @-` and diffed against the
+    current content with |vim.text.diff()|, so no diff text is parsed.
+3.  The hunks overlapping the range are applied to the parent version, which
+    yields the content `@-` should end up with.
+4.  `jj squash -i --from @ --into @- -- <path>` runs with a scripted one-shot
+    diff editor that writes that prepared content to $output. What lands in
+    $output is squashed; the rest stays in `@`.
+
+A file first added in `@` is handled: the absent parent version counts as empty.
+Pure deletions are hunks too, and, as in gitsigns, belong to the lines before and
+after the removed range.
+
+vim:tw=78:ts=8:ft=help:norl:
