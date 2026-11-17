@@ -4,8 +4,10 @@
 --- jj has no staging area, so "I have reviewed this hunk" is expressed by moving
 --- it into the parent change with `jj squash -i`. This module automates that for
 --- a single hunk from a normal editing buffer: it builds the parent file content
---- plus only the selected hunk(s), then drives `jj squash -i` with a scripted
---- one-shot diff editor that writes that prepared content to `$output`.
+--- plus only the selected hunk(s), then drives `jj squash -i` with a one-shot
+--- diff editor that copies the prepared content into `$output`. The editor is a
+--- headless `nvim -l` script run by the current nvim binary, so no shell,
+--- executable bit or coreutils are involved.
 ---
 --- Diff-editor contract of `jj squash -i --from @ --into @-`:
 ---   $left   = file version in the destination (@-)
@@ -32,9 +34,13 @@ local function run(cmd, opts)
   return vim.system(cmd, vim.tbl_extend("keep", opts or {}, { text = true })):wait()
 end
 
---- POSIX shell single-quote escaping.
-local function shq(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
+--- Quote a path as a TOML basic string, for embedding in a `--config` value.
+local function toml_str(s)
+  return '"' .. s:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+end
+
+local function to_lf(s)
+  return (s:gsub("\r\n", "\n"))
 end
 
 --- Split file content into lines, dropping only the final empty element
@@ -150,7 +156,7 @@ local function refresh_jj_diff_views(old_parent_id, relpath, root, file_bufnr)
     local name = vim.api.nvim_buf_get_name(buf)
     if name:sub(1, #prefix) == prefix and name:sub(#prefix + 1) == relpath then
       local show = run({ "jj", "file", "show", "-r", "@-", "--", relpath }, { cwd = root })
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, show.code == 0 and split_lines(show.stdout) or {})
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, show.code == 0 and split_lines(to_lf(show.stdout)) or {})
       vim.bo[buf].modified = false
       local new_parent_id = resolve_rev_id("@-", root)
       if new_parent_id and new_parent_id ~= old_parent_id then
@@ -211,12 +217,18 @@ function M.squash_lines(first, last)
   vim.fn.mkdir(tmpdir, "p")
 
   -- Destination (@-) version; a missing file means it was added in @.
-  local show = run({ "jj", "file", "show", "-r", "@-", "--", relpath }, { cwd = root })
+  -- text=false because vim.system's text mode rewrites \r\n to \n, which would
+  -- hide the parent's real line endings.
+  local show = run({ "jj", "file", "show", "-r", "@-", "--", relpath }, { cwd = root, text = false })
   if show.code ~= 0 and not show.stderr:match("No such path") then
     vim.fn.delete(tmpdir, "rf")
     return notify("jj file show failed:\n" .. vim.trim(show.stderr), vim.log.levels.ERROR)
   end
-  local parent_content = show.code == 0 and show.stdout or ""
+  local parent_raw = show.code == 0 and show.stdout or ""
+  -- jj can store LF while the working copy uses CRLF (working-copy.eol-conversion);
+  -- diffing the raw bytes would then mark every line as changed.
+  local eol = parent_raw:find("\r\n", 1, true) and "\r\n" or "\n"
+  local parent_content = to_lf(parent_raw)
   local parent_lines = split_lines(parent_content)
 
   -- Read the file from disk (== buffer content after the save above) so the
@@ -226,7 +238,7 @@ function M.squash_lines(first, last)
     vim.fn.delete(tmpdir, "rf")
     return notify("Cannot read file: " .. filepath, vim.log.levels.ERROR)
   end
-  local current_content = fh:read("*a") or ""
+  local current_content = to_lf(fh:read("*a") or "")
   fh:close()
 
   local hunks = diff_hunks(parent_content, current_content)
@@ -245,20 +257,22 @@ function M.squash_lines(first, last)
     return notify("No changed hunk under the cursor.", vim.log.levels.WARN)
   end
 
-  -- Prepared $output tree: parent content with only the selected hunks applied.
-  local out_path = tmpdir .. "/output_tree/" .. relpath
-  vim.fn.mkdir(vim.fn.fnamemodify(out_path, ":h"), "p")
-  vim.fn.writefile(apply_hunks(parent_lines, selected), out_path)
+  -- Prepared content: parent with only the selected hunks applied, in the
+  -- parent's own line endings. writefile() writes a Lua string as a blob, so the
+  -- bytes land unmodified.
+  local prepared = tmpdir .. "/prepared"
+  local prepared_lines = apply_hunks(parent_lines, selected)
+  vim.fn.writefile(#prepared_lines > 0 and (table.concat(prepared_lines, eol) .. eol) or "", prepared)
 
-  -- One-shot diff editor: copy the prepared file into $output and exit.
-  local script = tmpdir .. "/diff-editor.sh"
+  -- One-shot diff editor: headless nvim copies the prepared file into $output.
+  -- arg[1..3] are $left/$right/$output; jj passes arg[4]/arg[5] through verbatim.
+  local script = tmpdir .. "/diff-editor.lua"
   vim.fn.writefile({
-    "#!/bin/sh",
-    "dest=" .. '"$3"/' .. shq(relpath),
-    'mkdir -p "$(dirname "$dest")"',
-    "cp " .. shq(out_path) .. ' "$dest"',
+    'local dest = arg[3] .. "/" .. arg[5]',
+    'vim.fn.mkdir(vim.fn.fnamemodify(dest, ":h"), "p")',
+    "assert(vim.uv.fs_copyfile(arg[4], dest))",
+    "os.exit(0)",
   }, script)
-  vim.fn.setfperm(script, "rwxr-xr-x")
 
   -- Captured before the squash: afterwards @- points to a rewritten commit and
   -- jj.nvim's vdiff scratch buffer still carries the old id in its name.
@@ -273,7 +287,18 @@ function M.squash_lines(first, last)
     "--into",
     "@-",
     "--config",
-    string.format('ui.diff-editor=["%s","$left","$right","$output"]', script),
+    "ui.diff-editor=["
+      .. table.concat({
+        toml_str(vim.v.progpath),
+        '"-l"',
+        toml_str(script),
+        '"$left"',
+        '"$right"',
+        '"$output"',
+        toml_str(prepared),
+        toml_str(relpath),
+      }, ",")
+      .. "]",
     "--config",
     "ui.diff-instructions=false",
     "--",

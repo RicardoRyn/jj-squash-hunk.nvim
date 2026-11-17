@@ -18,6 +18,8 @@ into `@-`, the rest stays in `@` as work in progress.
 
 ## Requirements
 
+- Linux or macOS. Windows is untested: the diff editor is a headless `nvim -l`
+  script with no shell dependency, so it is expected to work.
 - Neovim >= 0.12 (`vim.text.diff`, `vim.fs.relpath`)
 - [`jj`](https://jj-vcs.github.io/jj/latest/) on `$PATH`
 - optional: [jj.nvim](https://github.com/NicolasGB/jj.nvim) — its open `jj://`
@@ -80,9 +82,9 @@ unchanged lines into a single hunk.
    no diff parsing).
 3. The hunks overlapping the cursor line or selection are applied to the parent
    version, producing the content the parent should end up with.
-4. `jj squash -i --from @ --into @- -- <path>` runs with a scripted one-shot diff
-   editor that writes that prepared content to `$output`. Whatever lands in
-   `$output` is squashed; everything else stays in `@`.
+4. `jj squash -i --from @ --into @- -- <path>` runs with a one-shot diff editor: a
+   headless `nvim -l` script that copies that prepared content into `$output`.
+   Whatever lands in `$output` is squashed; everything else stays in `@`.
 
 ## Notes
 
